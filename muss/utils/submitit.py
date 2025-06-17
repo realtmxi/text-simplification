@@ -8,7 +8,7 @@ from functools import wraps
 import traceback
 
 import numpy as np
-from submitit import AutoExecutor
+from submitit import AutoExecutor, LocalExecutor
 from submitit.helpers import DelayedSubmission
 from submitit.core.job_environment import JobEnvironment
 
@@ -45,7 +45,7 @@ def print_job_id(func):
 
 @generalized_lru_cache()
 def get_executor(
-    cluster='slurm',
+    cluster='local',
     submit_decorators=[
         make_function_checkpointable,
         print_function_name,
@@ -62,12 +62,30 @@ def get_executor(
     nodes=1,
     mem_gb=None,
     slurm_max_num_timeout=3,
+    max_local_workers=None,
     **kwargs,
 ):
     assert gpus_per_node <= 8
-    executor = AutoExecutor(
-        folder=SUBMITIT_JOB_DIR_FORMAT, cluster=cluster, slurm_max_num_timeout=slurm_max_num_timeout
-    )
+
+    if cluster=='local':
+        executor = LocalExecutor(
+            folder=SUBMITIT_JOB_DIR_FORMAT
+        )
+        params_to_update = {
+            'timeout_min': timeout_min,
+            'gpus_per_node': gpus_per_node, # LocalExecutor uses this to set CUDA_VISIBLE_DEVICES for sub-jobs
+            'cpus_per_task': cpus_per_task,
+            'nodes': nodes, # Typically 1 for local
+            'mem_gb': mem_gb,
+            # Pass only non-Slurm prefixed kwargs or known LocalExecutor updatable params
+            **{k: v for k, v in kwargs.items() if not k.startswith('slurm_')}
+        }
+    else:
+        raise ValueError(f"unsupported cluster type: {cluster}")
+
+    # executor = AutoExecutor(
+    #     folder=SUBMITIT_JOB_DIR_FORMAT, cluster=cluster, slurm_max_num_timeout=slurm_max_num_timeout
+    # )
     if catch:
         executor = executor_with_catch(executor)
     if cpus_per_task is None:
@@ -83,6 +101,10 @@ def get_executor(
         mem_gb=mem_gb,
         **kwargs,
     )
+    params_to_update['cpus_per_task'] = cpus_per_task
+    params_to_update['mem_gb'] = mem_gb
+
+    executor.update_parameters(**params_to_update)
     for decorator in submit_decorators:
         executor.submit = get_decorated_submit(executor.submit, decorator)
     return executor

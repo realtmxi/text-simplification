@@ -4,6 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+from faiss.loader import *
+
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
@@ -62,15 +65,45 @@ def cached_count_lines(filepath):
 
 
 def load_index(index_path):
-    return faiss.read_index(str(index_path))
+    co = faiss.GpuMultipleClonerOptions()
+    co.use_cuvs = False
+
+    idx = faiss.read_index(str(index_path))
+    
+    return faiss.index_cpu_to_all_gpus(idx, co=co)
 
 
 def load_indexes(index_paths):
     index = load_index(index_paths[0])
-    for index_path in index_paths[1:]:
+    pbar = tqdm(index_paths[1:])
+    for index_path in pbar:
+        pbar.set_description_str('Loading from ' + os.path.basename(index_path))
         faiss.merge_into(index, load_index(index_path), True)
-    return index
 
+    return index
+    # return faiss.index_cpu_to_all_gpus(index)
+    
+# def load_indexes(index_paths, gpu_id=0, gpu_resources=None, config=None):
+#     """Load and merge multiple indexes with explicit GPU control"""
+#     # Load first index
+#     index = load_index(index_paths[0])
+    
+#     # Merge additional indexes
+#     pbar = tqdm(index_paths[1:])
+#     for index_path in pbar:
+#         pbar.set_description_str('Loading from ' + os.path.basename(index_path))
+#         faiss.merge_into(index, load_index(index_path), True)
+    
+#     # Convert to GPU index with explicit control
+#     if gpu_resources is None:
+#         # Fallback to default behavior
+#         return faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), gpu_id, index)
+#     else:
+#         # Use provided resources and config
+#         if config is None:
+#             return faiss.index_cpu_to_gpu(gpu_resources, gpu_id, index)
+#         else:
+#             return faiss.index_cpu_to_gpu(gpu_resources, gpu_id, index, config)
 
 def get_index_path(sentences_path, indexes_dir):
     return Path(indexes_dir) / f'sentences-{get_file_hash(sentences_path)}.faiss_index'
@@ -97,6 +130,7 @@ def compute_and_save_embeddings(sentences_path, base_index_path, get_embeddings,
             embeddings = get_embeddings(sentences)
             index = load_index(base_index_path)
             index.add(embeddings)
+            index = faiss.index_gpu_to_cpu(index)
             faiss.write_index(index, str(index_path))
     return index_path
 
@@ -109,11 +143,11 @@ def get_nearest_sentence_ids(query_index, db_index, topk, nprobe, batch_size=102
             pass
         else:
             raise e
-    if use_gpu:
-        db_index = faiss.index_cpu_to_all_gpus(db_index)
+    # if use_gpu:
+        # db_index = faiss.index_cpu_to_all_gpus(db_index)
     all_distances = np.empty((query_index.ntotal, topk))
     all_sentence_ids = np.empty((query_index.ntotal, topk), dtype=int)
-    for batch_idx in range((query_index.ntotal // batch_size) + 1):
+    for batch_idx in tqdm(range((query_index.ntotal // batch_size) + 1), desc='Compute nearest neighbors'):
         start_idx = batch_idx * batch_size
         end_idx = min(start_idx + batch_size, query_index.ntotal)
         actual_batch_size = end_idx - start_idx
@@ -149,10 +183,13 @@ def compute_and_save_nn(query_sentences_path, db_sentences_paths, topk, nprobe, 
     results_path = get_results_path(query_sentences_path, db_sentences_paths, topk, nprobe, nn_search_results_dir)
     if results_path.exists():
         return results_path
+    
     query_index = load_index(get_index_path(query_sentences_path, indexes_dir))
     db_index = load_indexes([get_index_path(sentences_path, indexes_dir) for sentences_path in db_sentences_paths])
     distances, sentence_ids = get_nearest_sentence_ids(query_index, db_index, topk, nprobe)
+    
     dump_results(distances, sentence_ids, results_path)
+    
     return results_path
 
 
@@ -213,7 +250,7 @@ def compute_and_save_nn_batched(
     intermediary_results_paths = []
     offset = 0
     offsets = []
-    for db_sentences_paths_batch in tqdm(db_sentences_paths_batches, desc='Compute NN db batches'):
+    for db_sentences_paths_batch in tqdm(db_sentences_paths_batches, desc='Compute NN db batches'):        
         intermediary_results_path = compute_and_save_nn(
             query_sentences_path, db_sentences_paths_batch, topk, nprobe, indexes_dir, nn_search_results_dir
         )
@@ -451,3 +488,323 @@ def combine_simplifications_in_dataset(simplification_pairs, dataset):
                 for idx in tqdm(indexes[start_index:end_index]):
                     files.write(simplification_pairs[idx])
     return get_dataset_dir(dataset)
+
+
+# def compute_and_save_nn_batched_parallel(
+#     query_sentences_path,
+#     db_sentences_paths,
+#     topk,
+#     nprobe,
+#     indexes_dir,
+#     nn_search_results_dir,
+#     n_samples_per_gpu=1e5,
+#     delete_intermediary=True,
+#     n_jobs=3,
+# ):
+#     combined_results_path = get_results_path(
+#         query_sentences_path, db_sentences_paths, topk, nprobe, nn_search_results_dir
+#     )
+#     if combined_results_path.exists():
+#         return combined_results_path
+        
+#     # Batch db paths to fit on one GPU
+#     db_sentences_paths_batches = []
+#     batch = []
+#     n_batch_samples = 0
+#     for db_sentences_path in tqdm(db_sentences_paths, desc='Batching db files'):
+#         n_samples = cached_count_lines(db_sentences_path)
+#         if n_batch_samples + n_samples > n_samples_per_gpu:
+#             db_sentences_paths_batches.append(batch)
+#             batch = []
+#             n_batch_samples = 0
+#         batch.append(db_sentences_path)
+#         n_batch_samples += n_samples
+#     db_sentences_paths_batches.append(batch)
+    
+#     # Set up data for parallel jobs
+#     intermediary_results_paths = []
+#     offsets = []
+#     offset = 0
+#     for db_batch in db_sentences_paths_batches:
+#         # Generate expected result path for each batch
+#         result_path = get_results_path(
+#             query_sentences_path, db_batch, topk, nprobe, nn_search_results_dir
+#         )
+#         intermediary_results_paths.append(result_path)
+#         offsets.append(offset)
+#         offset += sum([cached_count_lines(sentences_path) for sentences_path in db_batch])
+    
+#     # Process batches that don't already exist
+#     batches_to_process = []
+#     for i, (batch, result_path) in enumerate(zip(db_sentences_paths_batches, intermediary_results_paths)):
+#         if not result_path.exists():
+#             batches_to_process.append((i, batch, result_path))
+    
+#     if batches_to_process:
+#         print(f"Processing {len(batches_to_process)} batches in parallel")
+        
+#         # Define the function to process one batch
+#         def process_batch(batch_idx, db_batch, result_path):
+#             # Make sure to use a specific GPU
+#             # gpu_id = batch_idx % n_jobs
+#             gpu_id = batch_idx % torch.cuda.device_count()
+#             print(f"Processing batch {batch_idx}")
+#             print(f"CUDA device count: {torch.cuda.device_count()}")
+#             print(f"Attempting to use GPU {gpu_id}")
+#             print(f"Current device: {torch.cuda.current_device()}")
+#             with torch.cuda.device(gpu_id):
+#                 print(f"Processing batch {batch_idx} on GPU {gpu_id}")
+                
+#                 # Load and prepare indexes
+#                 query_index = load_index(get_index_path(query_sentences_path, indexes_dir))
+#                 db_paths = [get_index_path(path, indexes_dir) for path in db_batch]
+#                 db_index = load_indexes(db_paths, gpu_id)
+                
+#                 # Get nearest neighbors
+#                 distances, sentence_ids = get_nearest_sentence_ids(
+#                     query_index, db_index, topk, nprobe
+#                 )
+                
+#                 # Save results
+#                 dump_results(distances, sentence_ids, result_path)
+                
+#                 return result_path
+        
+#         # Run in parallel with joblib
+#         Parallel(n_jobs=n_jobs, backend="threading")(
+#             delayed(process_batch)(batch_idx, db_batch, result_path) 
+#             for batch_idx, db_batch, result_path in batches_to_process
+#         )
+    
+#     # Check if all results were generated
+#     for path in intermediary_results_paths:
+#         if not path.exists():
+#             raise RuntimeError(f"Expected result file wasn't created: {path}")
+    
+#     if len(intermediary_results_paths) == 1:
+#         # If only one batch, no need to combine
+#         if combined_results_path != intermediary_results_paths[0]:
+#             import shutil
+#             shutil.copy(intermediary_results_paths[0], combined_results_path)
+#     else:
+#         # Combine and save final result
+#         distances, sentence_ids = print_running_time(combine_results_over_db_indexes)(
+#             intermediary_results_paths, offsets
+#         )
+#         dump_results(distances, sentence_ids, combined_results_path)
+        
+#         # Delete intermediary results
+#         if delete_intermediary:
+#             for intermediary_results_path in intermediary_results_paths:
+#                 try:
+#                     intermediary_results_path.unlink()
+#                 except:
+#                     pass
+                    
+#     return combined_results_path
+
+def compute_and_save_nn_batched_parallel(
+    query_sentences_path,
+    db_sentences_paths,
+    topk,
+    nprobe,
+    indexes_dir,
+    nn_search_results_dir,
+    n_samples_per_gpu=5e6,
+    delete_intermediary=True,
+    n_jobs=24,
+):
+    # Import necessary libraries
+    from tqdm import tqdm
+    import time
+    import datetime
+    import concurrent.futures
+    
+    # Track overall start time
+    overall_start_time = time.time()
+    
+    combined_results_path = get_results_path(
+        query_sentences_path, db_sentences_paths, topk, nprobe, nn_search_results_dir
+    )
+    if combined_results_path.exists():
+        return combined_results_path
+        
+    # Batch db paths to fit on one GPU
+    db_sentences_paths_batches = []
+    batch = []
+    n_batch_samples = 0
+    for db_sentences_path in tqdm(db_sentences_paths, desc='Batching db files'):
+        n_samples = cached_count_lines(db_sentences_path)
+        if n_batch_samples + n_samples > n_samples_per_gpu:
+            db_sentences_paths_batches.append(batch)
+            batch = []
+            n_batch_samples = 0
+        batch.append(db_sentences_path)
+        n_batch_samples += n_samples
+    if batch:  # Make sure to add the last batch if it's not empty
+        db_sentences_paths_batches.append(batch)
+    
+    # Set up data for parallel jobs
+    intermediary_results_paths = []
+    offsets = []
+    offset = 0
+    for db_batch in db_sentences_paths_batches:
+        # Generate expected result path for each batch
+        result_path = get_results_path(
+            query_sentences_path, db_batch, topk, nprobe, nn_search_results_dir
+        )
+        intermediary_results_paths.append(result_path)
+        offsets.append(offset)
+        offset += sum([cached_count_lines(sentences_path) for sentences_path in db_batch])
+    
+    # Process batches that don't already exist
+    batches_to_process = []
+    for i, (batch, result_path) in enumerate(zip(db_sentences_paths_batches, intermediary_results_paths)):
+        if not result_path.exists():
+            batches_to_process.append((i, batch, result_path))
+    
+    if batches_to_process:
+        total_batches = len(batches_to_process)
+        print(f"Processing {total_batches} batches in parallel across {torch.cuda.device_count()} GPUs")
+        
+        # Define the function to process one batch with improved GPU handling
+        def process_batch(batch_idx, db_batch, result_path):
+            batch_start_time = time.time()
+            
+            # Distribute work across all available GPUs
+            gpu_id = batch_idx % torch.cuda.device_count()
+            
+            # Print detailed debug information
+            print(f"Processing batch {batch_idx}")
+            print(f"CUDA device count: {torch.cuda.device_count()}")
+            print(f"Attempting to use GPU {gpu_id}")
+            
+            # Use more explicit device selection
+            torch.cuda.set_device(gpu_id)
+            print(f"Set device to GPU {gpu_id}, current device: {torch.cuda.current_device()}")
+            
+            try:
+                # Load and prepare indexes
+                query_index = load_index(get_index_path(query_sentences_path, indexes_dir))
+                db_paths = [get_index_path(path, indexes_dir) for path in db_batch]
+                
+                # Load indexes with explicit GPU configuration
+                try:
+                    # Try using optimized loading if available
+                    res = faiss.StandardGpuResources()
+                    config = faiss.GpuIndexFlatConfig()
+                    config.useFloat16 = True
+                    config.device = gpu_id
+                    db_index = load_indexes(db_paths, gpu_id, res, config)
+                except TypeError:
+                    # Fall back to standard loading if the optimized version isn't implemented
+                    db_index = load_indexes(db_paths)
+                
+                # Get nearest neighbors
+                distances, sentence_ids = get_nearest_sentence_ids(
+                    query_index, db_index, topk, nprobe
+                )
+                
+                # Save results
+                dump_results(distances, sentence_ids, result_path)
+                
+                batch_time = time.time() - batch_start_time
+                print(f"Successfully completed batch {batch_idx} on GPU {gpu_id} in {batch_time:.2f}s")
+                return batch_idx, batch_time
+                
+            except Exception as e:
+                print(f"Error processing batch {batch_idx} on GPU {gpu_id}: {e}")
+                # Re-raise to ensure job failure is tracked
+                raise
+        
+        # Use ThreadPoolExecutor for more dynamic work distribution
+        completed_batches = 0
+        batch_times = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(n_jobs, len(batches_to_process))) as executor:
+            # Submit initial batch of jobs
+            futures = {}
+            for batch_idx, db_batch, result_path in batches_to_process[:n_jobs]:
+                future = executor.submit(process_batch, batch_idx, db_batch, result_path)
+                futures[future] = (batch_idx, db_batch, result_path)
+            
+            # Monitor progress and estimate completion time
+            progress_bar = tqdm(total=total_batches, desc="Processing batches")
+            
+            # Process as completed
+            while futures:
+                # Wait for the next future to complete
+                done, _ = concurrent.futures.wait(
+                    futures, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                
+                for future in done:
+                    batch_idx, batch_time = future.result()
+                    completed_batches += 1
+                    batch_times.append(batch_time)
+                    
+                    # Update progress bar
+                    progress_bar.update(1)
+                    
+                    # Calculate and display ETA
+                    if len(batch_times) >= 3:  # After a few batches, we can estimate time
+                        avg_time_per_batch = sum(batch_times) / len(batch_times)
+                        remaining_batches = total_batches - completed_batches
+                        eta_seconds = avg_time_per_batch * remaining_batches / min(torch.cuda.device_count(), n_jobs)
+                        eta = str(datetime.timedelta(seconds=int(eta_seconds)))
+                        elapsed = str(datetime.timedelta(seconds=int(time.time() - overall_start_time)))
+                        
+                        progress_bar.set_description(
+                            f"Processing batches - {completed_batches}/{total_batches} - "
+                            f"Elapsed: {elapsed} - ETA: {eta}"
+                        )
+                    
+                    # Remove the completed future
+                    del futures[future]
+                    
+                    # Submit a new job if there are more to process
+                    next_idx = n_jobs + completed_batches - 1
+                    if next_idx < total_batches:
+                        batch_info = batches_to_process[next_idx]
+                        future = executor.submit(process_batch, *batch_info)
+                        futures[future] = batch_info
+            
+            progress_bar.close()
+    
+    # Check if all results were generated
+    missing_results = [path for path in intermediary_results_paths if not path.exists()]
+    if missing_results:
+        raise RuntimeError(f"Missing {len(missing_results)} expected result files")
+    
+    # Combine results
+    combine_start_time = time.time()
+    if len(intermediary_results_paths) == 1:
+        # If only one batch, no need to combine
+        if combined_results_path != intermediary_results_paths[0]:
+            import shutil
+            shutil.copy(intermediary_results_paths[0], combined_results_path)
+    else:
+        # Combine and save final result
+        print(f"Combining {len(intermediary_results_paths)} intermediary results...")
+        distances, sentence_ids = print_running_time(combine_results_over_db_indexes)(
+            intermediary_results_paths, offsets
+        )
+        dump_results(distances, sentence_ids, combined_results_path)
+        
+        # Delete intermediary results
+        if delete_intermediary:
+            deleted_count = 0
+            for intermediary_results_path in intermediary_results_paths:
+                try:
+                    intermediary_results_path.unlink()
+                    deleted_count += 1
+                except Exception as e:
+                    print(f"Warning: Could not delete {intermediary_results_path}: {e}")
+            print(f"Cleaned up {deleted_count}/{len(intermediary_results_paths)} intermediary files")
+                
+    # Print total time
+    total_time = time.time() - overall_start_time
+    print(f"Total processing time: {str(datetime.timedelta(seconds=int(total_time)))}")
+    print(f"Combined results saved to: {combined_results_path}")
+    
+    return combined_results_path

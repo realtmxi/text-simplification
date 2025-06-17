@@ -185,6 +185,8 @@ def get_language_from_dataset(dataset):
         return 'es'
     if '_it_' in dataset:
         return 'it'
+    if '_si_' in dataset:
+        return 'si'
     else:
         return 'en'
 

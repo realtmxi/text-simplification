@@ -41,6 +41,7 @@ ccnet_dir = Path(
         'Please download the CCNet corpus from https://github.com/facebookresearch/cc_net and enter the path to the downloaded data: '
     )
 )
+
 language = input('What language do you want to process? (en/fr/es/pt): ')
 cluster = 'local'
 dataset_dir = get_dataset_dir('uts') / language
@@ -49,7 +50,7 @@ slurm_partition = 'debug'
 slurm_array_parallelism = 1024
 
 # Split CCNet shards into subshards
-with log_action('Splitting CCNet shards into smaller subshards'):
+with log_action('Splitting CCNet shaai_coolwei-250rds into smaller subshards'):
     # We need to split each shard even more for the LASER embeddings to fit in memory
     n_shards = {  # Number of shards to take for each languages for ~1B sentences
         'en': 15,
@@ -111,6 +112,13 @@ with log_action('Creating base index'):
                 break
         if len(train_sentences) == n_train_sentences:
             break
+
+    print(f"Number of sentences collected: {len(train_sentences)}")
+    if len(train_sentences) == 0:
+        print("WARNING: No sentences were collected!")
+        print("Available sentence paths:", list(get_sentences_paths(dataset_dir)))
+    else:
+        print("First few sentences:", train_sentences[:3])
 
     base_index_dir = dataset_dir / f'base_indexes/'
     base_index_dir.mkdir(exist_ok=True, parents=True)

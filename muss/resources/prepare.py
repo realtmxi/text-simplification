@@ -73,3 +73,18 @@ def prepare_laser():
     if not LASER_DIR.exists():
         git_clone('https://github.com/facebookresearch/LASER.git', LASER_DIR)
         run_command(f'cd {LASER_DIR} && bash ./install_models.sh && bash ./install_external_tools.sh')
+
+def prepare_laser3():
+    """
+    Prepare LASER3 environment and download Sinhala model
+    """
+    os.environ['LASER'] = str(LASER_DIR)
+    
+    nllb_dir = LASER_DIR / 'nllb'
+    if not nllb_dir.exists():
+        git_clone('https://github.com/facebookresearch/LASER.git', LASER_DIR)
+        # First ensure base LASER is installed
+        run_command(f'cd {LASER_DIR} && bash ./install_external_tools.sh')
+    
+    # Download LASER3 Sinhala model using the script in nllb directory
+    run_command(f'cd {nllb_dir} && bash ./download_models.sh sin_Sinh')

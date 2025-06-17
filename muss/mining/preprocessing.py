@@ -134,5 +134,7 @@ def create_base_index(sentences, index_name, get_embeddings, metric, output_dir)
         with log_action('Training index'):
             index = faiss.index_factory(embeddings.shape[1], index_name, metric)
             index.train(embeddings)
+            
+        index = faiss.index_gpu_to_cpu(index)
         faiss.write_index(index, str(index_path))
     return index_path

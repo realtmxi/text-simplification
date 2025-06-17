@@ -14,6 +14,8 @@ from muss.resources.prepare import prepare_laser
 
 ENCODER_PATH = LASER_DIR / 'models/bilstm.93langs.2018-12-26.pt'
 BPE_CODES_PATH = LASER_DIR / 'models/93langs.fcodes'
+NLLB_DIR = LASER_DIR / 'nllb'
+LASER3_SINHALA_PATH = NLLB_DIR / 'laser3-sin_Sinh.v1.pt'
 
 
 @generalized_lru_cache(maxsize=1)
